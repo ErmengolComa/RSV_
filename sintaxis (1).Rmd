@@ -1,0 +1,156 @@
+---
+title: "VRS Time Series prediction"
+output: html_notebook
+---
+
+```{r message=TRUE, warning=TRUE, include=FALSE}
+library("data.table")
+library("ggplot2")
+library("lubridate")
+library("kableExtra")
+library("forecast")
+library("gridExtra")
+```
+
+# Load data 
+
+```{r include=FALSE}
+vrs_data <- fread("20210118_vrs_data.csv", header = T, sep = ";")
+vrs_data[, date := as.Date(date)]
+library(stringr)
+vrs_data[, Season := str_c(year(date %m+% months(-8)),"-",year(date %m+% months(4)))]
+```
+
+# Descriptive analysis
+
+## Participants
+
+```{r}
+vrs_data[, age_bis := ifelse(age < 2, "<2", "Between 2-4")]
+t <- vrs_data[, .(N_age = sum(vrs_cases, na.rm = T),
+                       N_sex
+                       = sum(vrs_cases[sex == "Female"])), c("Season", "age_bis")]
+t[, p_age := N_age/sum(N_age)*100, Season]
+t[, p_sex := N_sex/N_age*100]
+t[, ":=" (
+  Age = paste0(format(N_age, big.mark = ".", decimal.mark = ","), " (", format(round(p_age, 2), big.mark = ".", decimal.mark = ","), "%)"),
+  `% Female` = paste0(format(N_sex, big.mark = ".", decimal.mark = ","), " (", format(round(p_sex, 2), big.mark = ".", decimal.mark = ","), "%)")
+)]
+
+t_total <- vrs_data[, .(N_age = sum(vrs_cases, na.rm = T),
+                       N_sex
+                       = sum(vrs_cases[sex == "Female"])), c("Season")]
+t_total[, age_bis := "Total"]
+t_total[, p_age := N_age/sum(N_age)*100, Season]
+t_total[, p_sex := N_sex/N_age*100]
+t_total[, ":=" (
+  Age = paste0(format(N_age, big.mark = ".", decimal.mark = ","), " (", format(round(p_age, 2), big.mark = ".", decimal.mark = ","), "%)"),
+  `% Female` = paste0(format(N_sex, big.mark = ".", decimal.mark = ","), " (", format(round(p_sex, 2), big.mark = ".", decimal.mark = ","), "%)")
+)]
+t <- rbind(t[, c("Season", "age_bis", "Age", "% Female")],
+           t_total[, c("Season", "age_bis", "Age", "% Female")])
+```
+
+## VRS cases
+
+```{r}
+vrs_data[, periode := ifelse(Season == "2020-2021", "2020-2021 season",
+                                           ifelse(Season == "2019-2020", "2019-2020 season", "Seasons 2009-2010 to 2018-2019"))]
+```
+
+```{r}
+vrs_by_season <- vrs_data[, sum(vrs_cases), c("Season", "periode")]
+vrs_by_season[, mean(V1), c("periode")]
+```
+
+```{r}
+vrs_data_total <- vrs_data[, sum(vrs_cases), c("date")]
+seq_dates <- data.table(expand.grid("date" = seq(min(vrs_data$date), max(vrs_data$date), by="days")))
+vrs_data_all <- merge(vrs_data_total, seq_dates, all = T)
+vrs_data_all[, "V1"][is.na(vrs_data_all[, "V1"])] <- 0
+vrs_data_all[order(date), vrs_cases_7 := Reduce(`+`, shift(V1, 0:6))]
+
+library(stringr)
+vrs_data_all[, Season:= str_c(year(date %m+% months(-8)),"-",year(date %m+% months(4)))]
+```
+
+
+
+
+
+```{r}
+vrs_data_all[, season_type := ifelse(Season == "2020-2021", "2020-2021", "Others")]
+ggplot(vrs_data_all, aes(date, vrs_cases_7, linetype = season_type)) +
+  geom_line() +
+  theme_classic() +
+  labs(title = "", x = "", y = "7-day new RSV related disease cases", linetype = "") +
+  scale_linetype_manual(values = c("2020-2021" = 2, "Others" = 1)) 
+```
+
+# Time series analysis
+
+```{r}
+test <- vrs_data_all[!Season %in% c("2019-2020", "2020-2021") & !is.na(vrs_cases_7), c("date", "Season", "vrs_cases_7")]
+test <- test[order(date)]
+
+vrs_ts <- ts(test$vrs_cases_7, frequency = 365)
+
+fit <- tslm(vrs_ts ~ season, data = test)
+  
+new_data <- vrs_data_all[Season %in% c("2019-2020", "2020-2021"), c("date", "Season", "vrs_cases_7")]
+new_data <- new_data[order(date)]
+
+pred <- forecast(fit, h = nrow(new_data), level = c(80, 90, 95))
+  
+dt_predict <- as.data.table(pred)
+dt_predict[, date :=  seq(test[, max(date)] + 1 , to = test[, max(date)] + nrow(dt_predict), 1)]
+dt_predict <- merge(dt_predict, new_data[,  c("date", "Season", "vrs_cases_7")], by = "date", all.x = T)
+  
+```
+
+
+```{r}
+dg <- melt(dt_predict, id.vars = c("date", "Lo 95", "Hi 95"), measure.vars = c("vrs_cases_7", "Point Forecast"))
+dg[, variable := factor(variable, levels = c("Point Forecast", "vrs_cases_7"), labels = c("Expected", "Observed"))]
+```
+
+```{r}
+ggplot(dg, aes(date)) +
+  geom_line(aes(group = variable, y = value, linetype = variable)) +
+  geom_ribbon(aes(ymin = `Lo 95`, ymax = `Hi 95`), fill = "grey", alpha = .5) +
+  theme_classic() + labs(title = "", x = "", y = "7-day new RSV related disease cases", linetype = "") +
+  scale_x_date(breaks = "2 weeks") +
+  scale_linetype_manual(values = c("Expected" = 2, "Observed" = 1)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5),
+        legend.position = "bottom") 
+```
+
+# Càlcul excés
+
+```{r}
+dt_predict[, excess := ifelse(vrs_cases_7 > `Hi 95`, 1, 0)]
+dt_predict[, lack := ifelse(vrs_cases_7 < `Lo 95`, 1, 0)]
+```
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+periodes_lack <- dt_predict[lack == 1, 
+                              .(start = min(date), 
+                                end = max(date),
+                                expected = paste0(format(sum(`Point Forecast`)/7, big.mark = ".", decimal.mark = ",", digits = 4)), 
+                                observed = paste0(format(sum(vrs_cases_7)/7, big.mark = ".", decimal.mark = ",", digits = 4)), 
+                                cases = paste0(format(sum(`Point Forecast` - vrs_cases_7)/7, big.mark = ".", decimal.mark = ",", digits = 4), " [IC95%: ", format(sum(`Lo 95` - vrs_cases_7)/7, big.mark = ".", decimal.mark = ",", digits = 4), " - ", format(sum(`Hi 95` - vrs_cases_7)/7, big.mark = ".", decimal.mark = ",", digits = 4), "]"),
+                              perc = paste0(format(sum(`Point Forecast` - vrs_cases_7)/sum(`Point Forecast`)*100, big.mark = ".", decimal.mark = ",", digits = 4), " [IC95%: ", format(sum(`Lo 95` - vrs_cases_7)/sum(`Lo 95`)*100, big.mark = ".", decimal.mark = ",", digits = 4), " - ", format(sum(`Hi 95` - vrs_cases_7)/sum(`Hi 95`)*100, big.mark = ".", decimal.mark = ",", digits = 4), "]")),
+                              by = .(lack, g = cumsum(c(0, diff(date)) != 1))][order(start)]
+periodes_lack[, number_of_days := end - start]
+# periodes_defecte <- periodes_defecte[dies != 0]
+```
+
+
+```{r}
+
+setorderv(periodes_lack, c("start"))[, c(3:9)] %>%
+  kable(escape = F, caption = "", format.args = list(decimal.mark = ',', big.mark = "."), align = c("l", "l", "c", "c", "c", "c", "c")) %>%
+  kable_styling(full_width = T, position = "center") %>%
+  row_spec(0, bold = T)
+```
